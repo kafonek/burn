@@ -15,7 +15,6 @@ pub(crate) struct DistributedSyncServer<B: Backend> {
     num_devices: usize,
     devices_registered: usize,
     syncing_devices: Vec<Device<B>>,
-    devices_synced: usize,
     callbacks: HashMap<DeviceId, oneshot::Sender<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -29,7 +28,6 @@ impl<B: Backend> DistributedSyncServer<B> {
             num_devices,
             devices_registered: 0,
             syncing_devices: vec![],
-            devices_synced: 0,
             callbacks: HashMap::default(),
         }
     }
@@ -78,22 +76,27 @@ impl<B: Backend> DistributedSyncServer<B> {
     }
 
     fn try_launch_sync(&mut self) {
-        if self.all_reduce_ops_queue.is_empty() {
-            for d in self.syncing_devices.clone() {
-                let callback = self.callbacks.remove(&d.id()).unwrap();
-                let closure = Box::new(move || B::sync_collective(&d));
-                callback.send(closure).expect("Can send callback");
-                self.devices_synced += 1;
-            }
-            self.syncing_devices.clear();
+        // A device released before its peers arrive runs the next backward pass and registers
+        // its parameters into the round that is still closing. `devices_registered` then
+        // overshoots `num_devices`, `launch_ops` never matches again, and every device blocks
+        // forever. So release nobody until every device has reached the sync point.
+        if !self.all_reduce_ops_queue.is_empty() || self.syncing_devices.len() < self.num_devices {
+            return;
         }
 
-        if self.devices_synced == self.num_devices {
-            self.devices_registered = 0;
-            self.devices_synced = 0;
-            self.param_required_map.clear();
-            self.callbacks.clear();
+        self.devices_registered = 0;
+        self.param_required_map.clear();
+
+        for d in core::mem::take(&mut self.syncing_devices) {
+            let callback = self
+                .callbacks
+                .remove(&d.id())
+                .expect("Syncing device should have a callback");
+            let closure = Box::new(move || B::sync_collective(&d));
+            callback.send(closure).expect("Can send callback");
         }
+
+        self.callbacks.clear();
     }
 
     fn launch_ops(&mut self) {
