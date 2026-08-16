@@ -30,7 +30,7 @@ use burn_tensor::{
     module::conv2d,
     ops::ConvOptions,
 };
-use burn_std::id::ParamId;
+use burn_backend::distributed::DistributedParamId;
 use serial_test::serial;
 use std::sync::{Arc, Barrier};
 
@@ -95,7 +95,9 @@ fn peer(device: Device, barrier: Arc<Barrier>) -> Vec<String> {
         let weights: Vec<TestTensor<4>> = weights(&device)
             .into_iter()
             .enumerate()
-            .map(|(layer, weight)| weight.set_distributed(ParamId::from(layer as u64 + 1)))
+            .map(|(layer, weight)| {
+                weight.set_distributed(DistributedParamId::from(layer as u64 + 1))
+            })
             .collect();
         let norms = weight_gradient_norms(&device, &weights, &input);
 
