@@ -4,31 +4,32 @@ use crate::Backend;
 use crate::tensor::Device;
 
 use crate::distributed::{
-    DistributedConfig, DistributedParams, TensorRef, server::DistributedSyncServer,
+    DistributedConfig, DistributedParams, TensorRef,
+    server::{BackendSyncOps, DistributedSyncServer, SyncOps},
 };
 
-pub(crate) enum ActionMessage<B: Backend> {
-    Message(DistributedSyncMessage<B>),
+pub(crate) enum ActionMessage<S: SyncOps> {
+    Message(DistributedSyncMessage<S>),
     Close(),
 }
 
-pub(crate) enum DistributedSyncMessage<B: Backend> {
+pub(crate) enum DistributedSyncMessage<S: SyncOps> {
     RegisterSyncParameters(Vec<DistributedParams>),
-    TensorSync((TensorRef<B>, DistributedParams)),
+    TensorSync((S::Tensor, DistributedParams)),
     #[allow(clippy::type_complexity)]
-    CollectiveSync((Device<B>, oneshot::Sender<Box<dyn FnOnce() + Send>>)),
+    CollectiveSync((S::Device, oneshot::Sender<Box<dyn FnOnce() + Send>>)),
 }
 
 #[derive(Clone)]
 pub struct DistributedSyncClient<B: Backend> {
-    sender: Sender<ActionMessage<B>>,
+    sender: Sender<ActionMessage<BackendSyncOps<B>>>,
 }
 
 impl<B: Backend> DistributedSyncClient<B> {
     pub(crate) fn new(num_devices: usize, config: DistributedConfig) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let mut server = DistributedSyncServer::new(num_devices, config);
+        let mut server = DistributedSyncServer::<BackendSyncOps<B>>::new(num_devices, config);
         spawn(move || {
             while let ActionMessage::Message(msg) =
                 rx.recv().expect("Gradient sync server disconnected.")
