@@ -33,6 +33,8 @@ mod cummin;
 mod cumprod;
 mod cumsum;
 mod deform_conv2d;
+#[cfg(feature = "distributed")]
+mod distributed_conv_grad;
 mod div;
 mod erf;
 mod exp;
