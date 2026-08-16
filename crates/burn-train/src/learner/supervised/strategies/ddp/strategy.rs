@@ -101,6 +101,7 @@ impl<M: LearnerModel> SupervisedLearningStrategy<M> for DdpTrainingStrategy {
         // First training dataloader corresponds to main device
         let main_handle = DdpWorker::<M>::start(
             main_device.clone(),
+            0,
             learner.clone(),
             event_processor.clone(),
             worker_components.clone(),
@@ -109,14 +110,14 @@ impl<M: LearnerModel> SupervisedLearningStrategy<M> for DdpTrainingStrategy {
             Some(dataloader_valid),
             starting_epoch,
             peer_count,
-            true,
         );
 
         // Spawn other workers for the other devices, starting with peer id 1
         let mut secondary_workers = vec![];
-        for device in &self.devices[1..] {
+        for (index, device) in self.devices[1..].iter().enumerate() {
             let handle = DdpWorker::<M>::start(
                 device.clone(),
+                index + 1,
                 learner.clone(),
                 event_processor.clone(),
                 worker_components.clone(),
@@ -125,7 +126,6 @@ impl<M: LearnerModel> SupervisedLearningStrategy<M> for DdpTrainingStrategy {
                 None,
                 starting_epoch,
                 peer_count,
-                false,
             );
 
             secondary_workers.push(handle);
@@ -134,10 +134,11 @@ impl<M: LearnerModel> SupervisedLearningStrategy<M> for DdpTrainingStrategy {
         const MAIN_ID: usize = usize::MAX;
         let (result_tx, result_rx) = mpsc::channel();
 
-        for (id, worker) in secondary_workers.into_iter().enumerate() {
+        for (index, worker) in secondary_workers.into_iter().enumerate() {
             let tx = result_tx.clone();
+            let device_index = index + 1;
             thread::spawn(move || {
-                tx.send((id, worker.join())).ok();
+                tx.send((device_index, worker.join())).ok();
             });
         }
         {

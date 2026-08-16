@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 /// Event processing and validation is optional too.
 pub(crate) struct DdpWorker<M: LearnerModel> {
     device: Device,
+    device_index: usize,
     learner: Learner<M>,
     event_processor: Arc<Mutex<SupervisedTrainingEventProcessor<M>>>,
     components: WorkerComponents,
@@ -22,7 +23,6 @@ pub(crate) struct DdpWorker<M: LearnerModel> {
     dataloader_valid: Option<ValidLoader<M>>,
     starting_epoch: usize,
     peer_count: usize,
-    is_main: bool,
 }
 
 impl<M: LearnerModel> DdpWorker<M> {
@@ -30,6 +30,7 @@ impl<M: LearnerModel> DdpWorker<M> {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         device: Device,
+        device_index: usize,
         learner: Learner<M>,
         event_processor: Arc<Mutex<SupervisedTrainingEventProcessor<M>>>,
         components: WorkerComponents,
@@ -38,10 +39,10 @@ impl<M: LearnerModel> DdpWorker<M> {
         dataloader_valid: Option<ValidLoader<M>>,
         starting_epoch: usize,
         peer_count: usize,
-        is_main: bool,
     ) -> JoinHandle<M> {
         let worker = Self {
             device,
+            device_index,
             learner,
             event_processor,
             components,
@@ -50,14 +51,19 @@ impl<M: LearnerModel> DdpWorker<M> {
             dataloader_valid,
             starting_epoch,
             peer_count,
-            is_main,
         };
 
-        std::thread::spawn(|| worker.fit())
+        // Thread names are truncated to 15 bytes on Linux, so keep this short.
+        std::thread::Builder::new()
+            .name(std::format!("ddp-worker-{device_index}"))
+            .spawn(|| worker.fit())
+            .expect("Failed to spawn distributed data parallel worker thread")
     }
 
     /// Fits the model,
     pub fn fit(mut self) -> M {
+        // The worker on the first device is the main one: it validates and processes events.
+        let is_main = self.device_index == 0;
         let num_epochs = self.components.num_epochs;
         let interrupter = self.components.interrupter;
 
@@ -75,7 +81,7 @@ impl<M: LearnerModel> DdpWorker<M> {
         for training_progress in TrainingLoop::new(self.starting_epoch, num_epochs) {
             let epoch = training_progress.items_processed;
 
-            if self.is_main {
+            if is_main {
                 self.event_processor
                     .lock()
                     .unwrap()
@@ -93,7 +99,7 @@ impl<M: LearnerModel> DdpWorker<M> {
                 self.peer_count,
             );
 
-            if self.is_main {
+            if is_main {
                 self.event_processor
                     .lock()
                     .unwrap()
