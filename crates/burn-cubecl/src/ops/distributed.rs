@@ -19,12 +19,28 @@ impl<R: CubeRuntime> DistributedOps<Self> for CubeBackend<R> {
         op: ReduceOperation,
         device_ids: Vec<DeviceId>,
     ) -> CollectiveTensor<Self> {
-        let device = &tensor.device.clone();
-        let out_tensor = if tensor.handle.can_mut() && tensor.is_contiguous() {
+        let device = tensor.device.clone();
+        let stream = tensor.handle.stream;
+
+        // The gradient sync server calls this from its own thread, and an unpinned client takes
+        // its stream from the calling thread. Everything below would then be issued on the
+        // server thread's stream and ordered against the producing stream only through the
+        // runtime's shared-binding analysis, which compares against the point a buffer was
+        // allocated rather than the point it was last written. A gradient whose buffer was
+        // allocated before an earlier collective of the same round and written after it reads
+        // as already synchronized, so the reduction runs over a buffer the producing kernel has
+        // not finished writing. Pinning to the producing stream removes the cross-stream step:
+        // the fence the collective records there sits behind every kernel already queued on it.
+        let mut client = tensor.client.clone();
+        // SAFETY: `handle.stream` is where the tensor was produced, on the same device as
+        // `client`, and the pin is dropped with this local at the end of the call.
+        unsafe { client.set_stream(stream) };
+
+        let mut out_tensor = if tensor.handle.can_mut() && tensor.is_contiguous() {
             tensor
         } else {
             let zeros_tensor = zeros_client::<R>(
-                tensor.client.clone(),
+                client.clone(),
                 device.clone(),
                 tensor.shape(),
                 tensor.dtype(),
@@ -37,7 +53,6 @@ impl<R: CubeRuntime> DistributedOps<Self> for CubeBackend<R> {
             ReduceOperation::Mean => cubecl::server::ReduceOperation::Mean,
         };
 
-        let mut client = R::client(device);
         client.all_reduce(
             out_tensor.handle.clone(),
             out_tensor.handle.clone(),
@@ -45,6 +60,10 @@ impl<R: CubeRuntime> DistributedOps<Self> for CubeBackend<R> {
             device_ids.clone(),
             op,
         );
+
+        // The pin belongs to the collective, not to the tensor the caller gets back.
+        out_tensor.client = R::client(&device);
+
         CollectiveTensor::new(out_tensor)
     }
 
