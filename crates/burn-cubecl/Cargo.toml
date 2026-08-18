@@ -33,7 +33,6 @@ std = [
 doc = ["default"]
 
 tracing = [
-    "dep:tracing",
     "cubecl/tracing",
     "burn-std/tracing",
     "burn-backend/tracing",
@@ -75,7 +74,7 @@ cubek = { workspace = true, features = [
     "stdlib",
     "fft",
 ] }
-tracing = { workspace = true, features = ["attributes"], optional = true }
+tracing = { workspace = true, features = ["attributes"] }
 
 derive-new = { workspace = true }
 log = { workspace = true }

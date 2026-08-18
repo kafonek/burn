@@ -16,6 +16,9 @@ pub(crate) struct DistributedSyncServer<B: Backend> {
     devices_registered: usize,
     syncing_devices: Vec<Device<B>>,
     callbacks: HashMap<DeviceId, oneshot::Sender<Box<dyn FnOnce() + Send>>>,
+    // LAYER-TIMELINE PROBE: which round this server is currently closing. Bumped in
+    // `try_launch_sync` once a round's barrier actually releases every device.
+    round: usize,
 }
 
 impl<B: Backend> DistributedSyncServer<B> {
@@ -29,6 +32,7 @@ impl<B: Backend> DistributedSyncServer<B> {
             devices_registered: 0,
             syncing_devices: vec![],
             callbacks: HashMap::default(),
+            round: 0,
         }
     }
 
@@ -53,10 +57,31 @@ impl<B: Backend> DistributedSyncServer<B> {
             *self.param_required_map.entry(params.param_id).or_insert(0) += 1;
         });
         self.devices_registered += 1;
+        // LAYER-TIMELINE PROBE: server-side confirmation that a RegisterSyncParameters message
+        // was actually received and processed (not just sent by the client). No device id is
+        // available at this layer -- the message never carries one -- so cross-reference against
+        // the client-side `layer_timeline_register_params` log (which does have device_id) using
+        // round + devices_registered to line them up.
+        let param_ids: Vec<_> = sharded_params.iter().map(|p| p.param_id).collect();
+        tracing::info!(
+            round = self.round,
+            devices_registered = self.devices_registered,
+            num_devices = self.num_devices,
+            ?param_ids,
+            "layer_timeline_server_register_sync_params"
+        );
     }
 
     /// Called on registration of a gradient. Calls the all_reduce operation for any parameter that is no longer required in the autodiff graph.
     fn register_tensor(&mut self, tensor: TensorRef<B>, sharded_params: DistributedParams) {
+        // Safety: only reading the device, not accessing/modifying the tensor's data.
+        let device_id = unsafe { &*tensor.0 }.device().id();
+        tracing::info!(
+            round = self.round,
+            ?device_id,
+            param_id = ?sharded_params.param_id,
+            "layer_timeline_server_register_tensor"
+        );
         let op_queue = self
             .all_reduce_ops_queue
             .entry(sharded_params.param_id)
@@ -86,6 +111,8 @@ impl<B: Backend> DistributedSyncServer<B> {
 
         self.devices_registered = 0;
         self.param_required_map.clear();
+        tracing::info!(round = self.round, "layer_timeline_server_round_release");
+        self.round += 1;
 
         for d in core::mem::take(&mut self.syncing_devices) {
             let callback = self
@@ -101,6 +128,11 @@ impl<B: Backend> DistributedSyncServer<B> {
 
     fn launch_ops(&mut self) {
         if self.devices_registered == self.num_devices {
+            tracing::info!(
+                round = self.round,
+                devices_registered = self.devices_registered,
+                "layer_timeline_server_launch_ops_firing"
+            );
             for (param_id, num_tensors) in self.param_required_map.clone() {
                 let queued_tensors = self.all_reduce_ops_queue.entry(param_id).or_insert(vec![]);
 
@@ -110,6 +142,12 @@ impl<B: Backend> DistributedSyncServer<B> {
                         .iter()
                         .map(|t| unsafe { &*t.0 }.device().id())
                         .collect::<Vec<_>>();
+                    tracing::info!(
+                        round = self.round,
+                        ?param_id,
+                        ?device_ids,
+                        "layer_timeline_server_calling_all_reduce"
+                    );
                     let reduced_tensors: Vec<B::FloatTensorPrimitive> = queued_tensors
                         .iter()
                         .map(|tensor|

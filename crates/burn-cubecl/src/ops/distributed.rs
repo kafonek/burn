@@ -6,7 +6,7 @@ use crate::{CubeBackend, CubeRuntime};
 use crate::ops::numeric::{self, zeros_client};
 #[cfg(feature = "std")]
 use burn_backend::{
-    DeviceId, TensorMetadata,
+    DeviceId, DeviceOps, TensorMetadata,
     cubecl::dtype_to_elem_type,
     distributed::{CollectiveTensor, ReduceOperation},
     tensor::{Device, FloatTensor},
@@ -21,6 +21,18 @@ impl<R: CubeRuntime> DistributedOps<Self> for CubeBackend<R> {
     ) -> CollectiveTensor<Self> {
         let device = tensor.device.clone();
         let stream = tensor.handle.stream;
+
+        // LAYER-TIMELINE PROBE: entry to burn-cubecl's all_reduce, called once per device per
+        // parameter from `DistributedSyncServer::launch_ops` (on the server's own thread, not
+        // this device's training thread). No round/param_id is available in this function's
+        // signature -- cross-reference against `layer_timeline_server_calling_all_reduce`
+        // (which logs param_id + round + device_ids together) using device_id + shape.
+        tracing::info!(
+            device_id = ?device.id(),
+            shape = ?tensor.shape(),
+            ?device_ids,
+            "layer_timeline_cubecl_all_reduce_entry"
+        );
 
         // The gradient sync server calls this from its own thread, and an unpinned client takes
         // its stream from the calling thread. Everything below would then be issued on the
@@ -69,6 +81,7 @@ impl<R: CubeRuntime> DistributedOps<Self> for CubeBackend<R> {
 
     #[cfg(feature = "std")]
     fn sync_collective(device: &Device<Self>) {
+        tracing::info!(device_id = ?device.id(), "layer_timeline_cubecl_sync_collective");
         let client = R::client(device);
         client.sync_collective();
     }

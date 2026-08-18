@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::{
-    Backend, DeviceId, TensorMetadata,
+    Backend, DeviceId, DeviceOps, TensorMetadata,
     distributed::CollectiveTensor,
     tensor::{Device, FloatTensor},
 };
@@ -12,6 +12,15 @@ use crate::distributed::{DistributedConfig, DistributedParams, ReduceOperation};
 use crate::distributed::{
     close_distributed_sync_server, get_distributed_sync_client, start_distributed_sync_server,
 };
+
+// LAYER-TIMELINE PROBE: per-device (per-thread) round counter, incremented once per call to
+// `register_sync_parameters` (once per backward pass per device). Lets a per-rank timeline
+// line up "which round" across the client-side calls in this file, the server-side handling in
+// `server.rs`, and the burn-cubecl `all_reduce` entry.
+#[cfg(feature = "std")]
+thread_local! {
+    static LAYER_TIMELINE_ROUND: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
 
 /// Mutable reference to a float tensor.
 #[derive(Clone)]
@@ -64,9 +73,23 @@ pub trait DistributedOps<B: Backend> {
     /// * `distributed_params` - A list of [`DistributedParams`] of the tensors to sync.
     fn register_sync_parameters(_device: &B::Device, distributed_params: Vec<DistributedParams>) {
         #[cfg(feature = "std")]
-        if let Some(sync_client) = get_distributed_sync_client::<B>() {
-            sync_client.register_sync_parameters(distributed_params);
-        };
+        {
+            let round = LAYER_TIMELINE_ROUND.with(|r| {
+                let next = r.get() + 1;
+                r.set(next);
+                next
+            });
+            let param_ids: Vec<_> = distributed_params.iter().map(|p| p.param_id).collect();
+            tracing::info!(
+                device_id = ?_device.id(),
+                round,
+                ?param_ids,
+                "layer_timeline_register_params"
+            );
+            if let Some(sync_client) = get_distributed_sync_client::<B>() {
+                sync_client.register_sync_parameters(distributed_params);
+            };
+        }
         #[cfg(not(feature = "std"))]
         let _ = distributed_params;
     }
@@ -78,9 +101,17 @@ pub trait DistributedOps<B: Backend> {
     /// * `device` - The device on which to sync.
     fn submit_sync_collective(device: &B::Device) {
         #[cfg(feature = "std")]
-        if let Some(sync_client) = get_distributed_sync_client::<B>() {
-            sync_client.submit_sync_collective(device.clone());
-        };
+        {
+            let round = LAYER_TIMELINE_ROUND.with(|r| r.get());
+            tracing::info!(
+                device_id = ?device.id(),
+                round,
+                "layer_timeline_submit_sync_collective"
+            );
+            if let Some(sync_client) = get_distributed_sync_client::<B>() {
+                sync_client.submit_sync_collective(device.clone());
+            };
+        }
         #[cfg(not(feature = "std"))]
         let _ = device;
     }
@@ -96,9 +127,23 @@ pub trait DistributedOps<B: Backend> {
     /// * `distributed_params` - The [`DistributedParams`] for the parameter.
     fn submit_gradient_sync(tensor: TensorRef<B>, distributed_params: DistributedParams) {
         #[cfg(feature = "std")]
-        if let Some(sync_client) = get_distributed_sync_client::<B>() {
-            sync_client.submit_gradient_sync(tensor, distributed_params);
-        };
+        {
+            let round = LAYER_TIMELINE_ROUND.with(|r| r.get());
+            // Safety: only reading the device and shape, not accessing/modifying the data.
+            let tensor_ref = unsafe { &*tensor.0 };
+            let device_id = tensor_ref.device().id();
+            let shape = tensor_ref.shape();
+            tracing::info!(
+                ?device_id,
+                round,
+                param_id = ?distributed_params.param_id,
+                ?shape,
+                "layer_timeline_submit_gradient_sync"
+            );
+            if let Some(sync_client) = get_distributed_sync_client::<B>() {
+                sync_client.submit_gradient_sync(tensor, distributed_params);
+            };
+        }
         #[cfg(not(feature = "std"))]
         let _ = (tensor, distributed_params);
     }
