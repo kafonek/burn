@@ -1,4 +1,4 @@
-use std::{sync::mpsc::Sender, thread::spawn};
+use std::sync::mpsc::Sender;
 
 use crate::Backend;
 use crate::tensor::Device;
@@ -29,13 +29,20 @@ impl<B: Backend> DistributedSyncClient<B> {
         let (tx, rx) = std::sync::mpsc::channel();
 
         let mut server = DistributedSyncServer::new(num_devices, config);
-        spawn(move || {
-            while let ActionMessage::Message(msg) =
-                rx.recv().expect("Gradient sync server disconnected.")
-            {
-                server.process_message(msg)
-            }
-        });
+        // LAYER-TIMELINE PROBE: this thread had no name at all before this branch (confirmed by
+        // reading every file in this module) -- a /proc capture during a hang could not tell it
+        // apart from any other unnamed thread. Named so a future capture can identify it
+        // directly, without relying on it being "whichever thread is left over".
+        std::thread::Builder::new()
+            .name("dist-sync-srv".into())
+            .spawn(move || {
+                while let ActionMessage::Message(msg) =
+                    rx.recv().expect("Gradient sync server disconnected.")
+                {
+                    server.process_message(msg)
+                }
+            })
+            .expect("Failed to spawn the distributed sync server thread");
         Self { sender: tx }
     }
 
